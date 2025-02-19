@@ -8,3 +8,6 @@ python-jose[cryptography]
 passlib[bcrypt]
 pyjwt
 python-multipart
+openai
+pinecone-client
+transformers

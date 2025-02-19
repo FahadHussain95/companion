@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from http import HTTPStatus
 
 from constants import (
@@ -11,9 +11,9 @@ from constants import (
     ACCESS_TOKEN_EXPIRY,
     USER_NOT_FOUND,
     RESPONSE_SAVED,
-    QUESTION_CREATED
+    QUESTION_CREATED, RESPONSE_NOT_FOUND
 )
-from utils import get_authenticated_user
+from utils import get_authenticated_user, update_user_profile
 from database import engine, Base, get_db
 from models import (
     User,
@@ -76,9 +76,13 @@ class BulkSurveyQuestionsCreate(BaseModel):
     questions: List[SurveyQuestionCreate]
 
 
-class SurveyAnswer(BaseModel):
+class SurveyResponseCreate(BaseModel):
     question_id: int
     response_text: str
+
+
+class BulkSurveyResponseCreate(BaseModel):
+    responses: List[SurveyResponseCreate]
 
 
 @app.post("/register/")
@@ -117,38 +121,6 @@ def get_me(current_user: dict = Depends(get_current_user), db: Session = Depends
     }
 
 
-@app.post("/users/profile/")
-def create_user_profile(
-    profile_data: UserProfileCreate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
-    user = get_authenticated_user(db, current_user)
-
-    if db.query(UserProfile).filter(UserProfile.user_id == user.id).first():
-        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=PROFILE_EXISTS)
-
-    new_profile = UserProfile(user_id=user.id, **profile_data.dict())
-    db.add(new_profile)
-    db.commit()
-    db.refresh(new_profile)
-    return new_profile
-
-
-@app.get("/users/profile/")
-def get_user_profile(
-        db: Session = Depends(get_db),
-        current_user: dict = Depends(get_current_user)
-):
-    print("here:")
-    user = get_authenticated_user(db, current_user)
-    profile = db.query(UserProfile).filter(UserProfile.user_id == user.id).first()
-    if not profile:
-        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=PROFILE_NOT_FOUND)
-
-    return profile
-
-
 @app.get("/survey/questions/")
 def get_survey_questions(db: Session = Depends(get_db)):
     questions = db.query(SurveyQuestion).all()
@@ -171,21 +143,58 @@ def create_bulk_survey_questions(
     return {"message": QUESTION_CREATED, "count": len(new_questions)}
 
 
-@app.post("/survey/answers/")
+@app.post("/survey/responses/")
 def submit_survey_answer(
-        answers: List[SurveyAnswer],
+        response_data: BulkSurveyResponseCreate,
         db: Session = Depends(get_db),
         current_user: dict = Depends(get_current_user)
 ):
     user = get_authenticated_user(db, current_user)
 
-    for answer in answers:
-        new_response = SurveyResponse(
-            user_id=user.id,
-            question_id=answer.question_id,
-            response_text=answer.response_text
-        )
-        db.add(new_response)
+    for response in response_data.responses:
+        existing_response = db.query(SurveyResponse).filter(
+            SurveyResponse.user_id == user.id,
+            SurveyResponse.question_id == response.question_id
+        ).first()
+        if existing_response:
+            existing_response.response_text = response.response_text
+        else:
+            new_response = SurveyResponse(
+                user_id=user.id,
+                question_id=response.question_id,
+                response_text=response.response_text
+            )
+            db.add(new_response)
 
     db.commit()
-    return {"message": RESPONSE_SAVED}
+    updated_profile = update_user_profile(db, user.id)
+    return {"message": RESPONSE_SAVED, "updated_profile": updated_profile}
+
+
+@app.get("/survey/responses/")
+def get_user_survey_responses(
+        db: Session = Depends(get_db),
+        current_user: dict = Depends(get_current_user)
+):
+    user = get_authenticated_user(db, current_user)
+
+    responses = (
+        db.query(SurveyResponse)
+        .options(joinedload(SurveyResponse.question))
+        .filter(SurveyResponse.user_id == user.id)
+        .order_by(SurveyResponse.question_id.asc())
+        .all()
+    )
+
+    if not responses:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND, detail=RESPONSE_NOT_FOUND)
+
+    return [
+        {
+            "question_id": response.question_id,
+            "question_text": response.question.question_text,
+            "response_id": response.id,
+            "response_text": response.response_text,
+        }
+        for response in responses
+    ]
